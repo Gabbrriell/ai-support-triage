@@ -1,0 +1,353 @@
+{
+  "name": "Ticket triage",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ticket",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "477292eb-60d5-4e71-99df-067a060d821d",
+      "name": "Webhook",
+      "webhookId": "50ec5eae-f01e-4f19-874d-92b377a54256"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO tickets (subject, body, customer_email, account_name, raw_payload)\nVALUES ($1, $2, $3, $4, $5::jsonb)\nRETURNING id, received_at;",
+        "options": {
+          "queryReplacement": "={{ [ $json.body.subject, $json.body.body, $json.body.customer_email, $json.body.account_name, JSON.stringify($json.body) ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        224,
+        0
+      ],
+      "id": "4c250b73-fc67-456d-883a-cbab3b23f2b3",
+      "name": "Save ticket",
+      "credentials": {
+        "postgres": {
+          "id": "haRzgJr5IZCml1gf",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "let r = {};\ntry {\n  r = JSON.parse($json.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}');\n} catch (e) { r = {}; }\n\nconst CATS = ['data_discrepancy','connector_auth','api_error','billing','other'];\nconst PRIS = ['urgent','high','normal','low'];\nconst is_valid = CATS.includes(r.category) && PRIS.includes(r.priority)\n  && typeof r.confidence === 'number' && r.confidence >= 0 && r.confidence <= 1;\n\nreturn {\n  ticket_id: $('Save ticket').item.json.id,\n  category: is_valid ? r.category : null,\n  priority: is_valid ? r.priority : null,\n  confidence: is_valid ? r.confidence : null,\n  reasoning: r.reasoning ?? null,\n  is_valid,\n  raw_response: JSON.stringify($json),\n  model: $json.modelVersion,\n  input_tokens: $json.usageMetadata?.promptTokenCount,\n  output_tokens: $json.usageMetadata?.candidatesTokenCount,\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        0
+      ],
+      "id": "0a755eed-f22a-4ad5-8745-2a6946cb3f1a",
+      "name": "Validate"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  systemInstruction: { parts: [{ text: `You triage support tickets for a marketing data platform that pulls data from ad platforms (Meta Ads, Google Ads, GA4, TikTok) into a warehouse and dashboards. Classify the ticket.\n\nCategories:\n- data_discrepancy: numbers differ from the source platform, or data is missing or delayed\n- connector_auth: a connection failed because of login, OAuth, expired token or permissions\n- api_error: extraction or API failures, rate limits, timeouts, error codes, schema changes\n- billing: invoices, payments, plan or pricing\n- other: anything else\n\nPriority:\n- urgent: pipeline down for many accounts, or business-critical impact today\n- high: a connector or report is broken and blocking the customer\n- normal: partial issue or question with a workaround\n- low: how-to questions, feature requests\n\nConfidence: 0 to 1, how sure you are about the category. Go below 0.6 if the ticket is vague or fits several categories. Reasoning: one short sentence.` }] },\n  contents: [{ role: \"user\", parts: [{ text: \"Subject: \" + $('Webhook').item.json.body.subject + \"\\n\\n\" + $('Webhook').item.json.body.body }] }],\n  generationConfig: {\n    temperature: 0,\n    responseMimeType: \"application/json\",\n    responseSchema: {\n      type: \"OBJECT\",\n      properties: {\n        category: { type: \"STRING\", enum: [\"data_discrepancy\",\"connector_auth\",\"api_error\",\"billing\",\"other\"] },\n        priority: { type: \"STRING\", enum: [\"urgent\",\"high\",\"normal\",\"low\"] },\n        confidence: { type: \"NUMBER\" },\n        reasoning: { type: \"STRING\" }\n      },\n      required: [\"category\",\"priority\",\"confidence\",\"reasoning\"]\n    }\n  }\n}) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        448,
+        0
+      ],
+      "id": "594f3e00-6729-480f-a870-703aef2330fd",
+      "name": "Ask AI",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "jfN1eabnKfLwymtE",
+          "name": "gogl"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH c AS (\n  INSERT INTO classifications\n    (ticket_id, category, priority, confidence, reasoning, is_valid, raw_response, model, prompt_version, input_tokens, output_tokens)\n  VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, 'v1', $9, $10)\n  RETURNING id, ticket_id, category, priority, confidence, is_valid\n)\nUPDATE tickets t\nSET status = CASE WHEN c.is_valid THEN 'classified' ELSE 'error' END, updated_at = now()\nFROM c WHERE t.id = c.ticket_id\nRETURNING c.*;",
+        "options": {
+          "queryReplacement": "={{ [ $json.ticket_id, $json.category, $json.priority, $json.confidence, $json.reasoning, $json.is_valid, $json.raw_response, $json.model, $json.input_tokens, $json.output_tokens ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        896,
+        0
+      ],
+      "id": "4912b4dd-03c6-4e99-a034-2b59d2626139",
+      "name": "Save classification",
+      "credentials": {
+        "postgres": {
+          "id": "haRzgJr5IZCml1gf",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  systemInstruction: { parts: [{ text: `You draft replies for support agents at a marketing data platform (pulls Meta Ads, Google Ads, GA4 etc. into dashboards). A human reviews every draft before sending.\n\nRules:\n- Use ONLY the KB articles provided. Never invent causes, features, fixes or timelines.\n- If the articles don't clearly cover the issue, set is_unsure to true. The reply should then acknowledge the issue, ask for the specific details needed, and say the team will investigate.\n- Ask for concrete details when relevant: account or property IDs, date range, exact numbers, error text.\n- Friendly, clear, concise. No promises about fix dates.\n- used_article_ids: ids of the articles you actually relied on.` }] },\n  contents: [{ role: \"user\", parts: [{ text:\n    \"TICKET\\nSubject: \" + $('Webhook').item.json.body.subject + \"\\n\\n\" + $('Webhook').item.json.body.body +\n    \"\\n\\nCATEGORY: \" + $('Save classification').item.json.category +\n    \"\\n\\nKB ARTICLES:\\n\" + ($('KB lookup').item.json.articles.map(a => \"[\" + a.id + \"] \" + a.title + \"\\n\" + a.body).join(\"\\n\\n\") || \"No matching articles found.\")\n  }] }],\n  generationConfig: {\n    temperature: 0.2,\n    responseMimeType: \"application/json\",\n    responseSchema: {\n      type: \"OBJECT\",\n      properties: {\n        reply: { type: \"STRING\" },\n        is_unsure: { type: \"BOOLEAN\" },\n        used_article_ids: { type: \"ARRAY\", items: { type: \"INTEGER\" } }\n      },\n      required: [\"reply\", \"is_unsure\", \"used_article_ids\"]\n    }\n  }\n}) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1296,
+        0
+      ],
+      "id": "3058694d-f482-445a-bb25-d11b8252e1d1",
+      "name": "Draft reply",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "jfN1eabnKfLwymtE",
+          "name": "gogl"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT coalesce(json_agg(k), '[]'::json) AS articles, count(*) AS hits\nFROM search_kb($1, $2, 3) k;",
+        "options": {
+          "queryReplacement": "={{ [ $('Webhook').item.json.body.subject + ' ' + $('Webhook').item.json.body.body, $('Save classification').item.json.category ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1120,
+        0
+      ],
+      "id": "d5de6af7-25e0-4045-b436-5bdb90d6910e",
+      "name": "KB lookup",
+      "credentials": {
+        "postgres": {
+          "id": "haRzgJr5IZCml1gf",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "let d = {};\ntry {\n  d = JSON.parse($json.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}');\n} catch (e) { d = {}; }\n\nreturn {\n  reply: d.reply ?? null,\n  // no reply at all counts as unsure too\n  is_unsure: d.is_unsure === true || !d.reply,\n  used_article_ids: Array.isArray(d.used_article_ids) ? d.used_article_ids.filter(Number.isInteger) : [],\n  model: $json.modelVersion,\n  input_tokens: $json.usageMetadata?.promptTokenCount,\n  output_tokens: $json.usageMetadata?.candidatesTokenCount,\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1472,
+        0
+      ],
+      "id": "5d6d262d-7276-4f21-a736-54270a98a5ce",
+      "name": "Parse draft"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const c = $('Save classification').item.json;\nconst reasons = [];\n\nif (!c.is_valid) reasons.push('invalid_classification');\nif (c.confidence !== null && Number(c.confidence) < 0.7) reasons.push('confidence<0.7');\nif (['urgent', 'high'].includes(c.priority)) reasons.push('priority=' + c.priority);\nif ($json.is_unsure) reasons.push('model_unsure');\n\nreturn {\n  ...$json,\n  ticket_id: c.ticket_id,\n  classification_id: c.id,\n  routed_to: reasons.length ? 'human_queue' : 'draft_review',\n  routing_reason: reasons.join(', ') || 'confident, normal priority',\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1696,
+        0
+      ],
+      "id": "94ee1e34-1d2a-4e9e-a4ee-13ca885b21a3",
+      "name": "Route"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH d AS (\n  INSERT INTO drafts\n    (ticket_id, classification_id, draft_body, kb_article_ids, model_unsure,\n     routed_to, routing_reason, model, prompt_version, input_tokens, output_tokens)\n  VALUES ($1, $2, $3, $4::bigint[], $5, $6, $7, $8, 'v1', $9, $10)\n  RETURNING id, ticket_id, routed_to, routing_reason\n)\nUPDATE tickets t SET status = d.routed_to, updated_at = now()\nFROM d WHERE t.id = d.ticket_id\nRETURNING d.*;",
+        "options": {
+          "queryReplacement": "={{ [ $json.ticket_id, $json.classification_id, $json.reply, '{' + $json.used_article_ids.join(',') + '}', $json.is_unsure, $json.routed_to, $json.routing_reason, $json.model, $json.input_tokens, $json.output_tokens ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1920,
+        0
+      ],
+      "id": "cba3edd7-16ef-4be7-af1d-26b593f485b3",
+      "name": "Save draft",
+      "credentials": {
+        "postgres": {
+          "id": "haRzgJr5IZCml1gf",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {
+    "Webhook": [
+      {
+        "json": {
+          "headers": {
+            "user-agent": "Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.26100.9444",
+            "content-type": "application/json",
+            "host": "localhost:5678",
+            "content-length": "295",
+            "expect": "100-continue"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "subject": "URGENT: Google Ads connector failing",
+            "customer_email": "mark@globex.com",
+            "body": "All our Google Ads extractions fail since this morning with invalid_grant. Our exec dashboard is empty and we present to the board in 2 hours.",
+            "account_name": "Globex"
+          },
+          "webhookUrl": "http://localhost:5678/webhook-test/ticket",
+          "executionMode": "test"
+        },
+        "pairedItem": {
+          "item": 0
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Save ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save ticket": {
+      "main": [
+        [
+          {
+            "node": "Ask AI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate": {
+      "main": [
+        [
+          {
+            "node": "Save classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask AI": {
+      "main": [
+        [
+          {
+            "node": "Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save classification": {
+      "main": [
+        [
+          {
+            "node": "KB lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "KB lookup": {
+      "main": [
+        [
+          {
+            "node": "Draft reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft reply": {
+      "main": [
+        [
+          {
+            "node": "Parse draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse draft": {
+      "main": [
+        [
+          {
+            "node": "Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route": {
+      "main": [
+        [
+          {
+            "node": "Save draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "a1ea2125-d549-4d17-b772-091139e8bbb0",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "3e67caf4ae95887d357519f3054a1b3806511d544a3ca95b9b584e94cd726230"
+  },
+  "nodeGroups": [],
+  "id": "9RBe3rE63svEiBda",
+  "tags": []
+}
