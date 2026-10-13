@@ -43,7 +43,7 @@
     {
       "parameters": {
         "mode": "runOnceForEachItem",
-        "jsCode": "let r = {};\ntry {\n  r = JSON.parse($json.choices?.[0]?.message?.content ?? '{}');\n} catch (e) { r = {}; }\n\nconst CATS = ['data_discrepancy','connector_auth','api_error','billing','other'];\nconst PRIS = ['urgent','high','normal','low'];\nconst is_valid = CATS.includes(r.category) && PRIS.includes(r.priority)\n  && typeof r.confidence === 'number' && r.confidence >= 0 && r.confidence <= 1;\n\nreturn {\n  ticket_id: $('Save ticket').item.json.id,\n  category: is_valid ? r.category : null,\n  priority: is_valid ? r.priority : null,\n  confidence: is_valid ? r.confidence : null,\n  reasoning: r.reasoning ?? null,\n  is_valid,\n  raw_response: JSON.stringify($json),\n  model: $json.model ?? null,\n  input_tokens: $json.usage?.prompt_tokens ?? null,\n  output_tokens: $json.usage?.completion_tokens ?? null,\n};"
+        "jsCode": "let r = {};\ntry {\n  r = JSON.parse($json.choices?.[0]?.message?.content ?? '{}');\n} catch (e) { r = {}; }\n\nconst CATS = ['data_discrepancy','connector_auth','api_error','billing','other'];\nconst PRIS = ['urgent','high','normal','low'];\nconst is_valid = CATS.includes(r.category) && PRIS.includes(r.priority)\n  && typeof r.confidence === 'number' && r.confidence >= 0 && r.confidence <= 1;\n\nreturn {\n  ticket_id: $('Save ticket').item.json.id,\n  classified_at: new Date().toISOString(),\n  category: is_valid ? r.category : null,\n  priority: is_valid ? r.priority : null,\n  confidence: is_valid ? r.confidence : null,\n  reasoning: r.reasoning ?? null,\n  is_valid,\n  raw_response: JSON.stringify($json),\n  model: $json.model ?? null,\n  input_tokens: $json.usage?.prompt_tokens ?? null,\n  output_tokens: $json.usage?.completion_tokens ?? null,\n};"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -108,7 +108,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT coalesce(json_agg(k), '[]'::json) AS articles, count(*) AS hits\nFROM search_kb($1, $2, 3) k;",
+        "query": "SELECT coalesce(json_agg(k), '[]'::json) AS articles, count(*) AS hits, clock_timestamp() AS kb_done_at\nFROM search_kb($1, $2, 3) k;",
         "options": {
           "queryReplacement": "={{ [ $('Webhook').item.json.body.subject + ' ' + $('Webhook').item.json.body.body, $('Save classification').item.json.category ] }}"
         }
@@ -131,7 +131,7 @@
     {
       "parameters": {
         "mode": "runOnceForEachItem",
-        "jsCode": "let d = {};\ntry {\n  d = JSON.parse($json.choices?.[0]?.message?.content ?? '{}');\n} catch (e) { d = {}; }\n\nreturn {\n  reply: d.reply ?? null,\n  is_unsure: d.is_unsure === true || !d.reply,\n  used_article_ids: Array.isArray(d.used_article_ids) ? d.used_article_ids.filter(Number.isInteger) : [],\n  model: $json.model ?? null,\n  input_tokens: $json.usage?.prompt_tokens ?? null,\n  output_tokens: $json.usage?.completion_tokens ?? null,\n};"
+        "jsCode": "let d = {};\ntry {\n  d = JSON.parse($json.choices?.[0]?.message?.content ?? '{}');\n} catch (e) { d = {}; }\n\nreturn {\n  reply: d.reply ?? null,\n  drafted_at: new Date().toISOString(),\n  is_unsure: d.is_unsure === true || !d.reply,\n  used_article_ids: Array.isArray(d.used_article_ids) ? d.used_article_ids.filter(Number.isInteger) : [],\n  model: $json.model ?? null,\n  input_tokens: $json.usage?.prompt_tokens ?? null,\n  output_tokens: $json.usage?.completion_tokens ?? null,\n};"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -214,36 +214,32 @@
         }
       },
       "onError": "continueRegularOutput"
-    }
-  ],
-  "pinData": {
-    "Webhook": [
-      {
-        "json": {
-          "headers": {
-            "user-agent": "Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.26100.9444",
-            "content-type": "application/json",
-            "host": "localhost:5678",
-            "content-length": "295",
-            "expect": "100-continue"
-          },
-          "params": {},
-          "query": {},
-          "body": {
-            "subject": "URGENT: Google Ads connector failing",
-            "customer_email": "mark@globex.com",
-            "body": "All our Google Ads extractions fail since this morning with invalid_grant. Our exec dashboard is empty and we present to the board in 2 hours.",
-            "account_name": "Globex"
-          },
-          "webhookUrl": "http://localhost:5678/webhook-test/ticket",
-          "executionMode": "test"
-        },
-        "pairedItem": {
-          "item": 0
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO pipeline_steps (ticket_id, n8n_execution_id, step, status, started_at, finished_at, meta)\nVALUES\n  ($1, $2, 'classify',  $3,   $4::timestamptz, $5::timestamptz, $8::jsonb),\n  ($1, $2, 'kb_lookup', 'ok', $5::timestamptz, $6::timestamptz, $9::jsonb),\n  ($1, $2, 'draft',     'ok', $6::timestamptz, $7::timestamptz, $10::jsonb),\n  ($1, $2, 'route',     'ok', $7::timestamptz, clock_timestamp(), NULL)\nRETURNING step, duration_ms;",
+        "options": {
+          "queryReplacement": "={{ [\n  $('Save ticket').item.json.id,\n  $execution.id,\n  $('Validate').item.json.is_valid ? 'ok' : 'error',\n  $('Save ticket').item.json.received_at,\n  $('Validate').item.json.classified_at,\n  $('KB lookup').item.json.kb_done_at,\n  $('Parse draft').item.json.drafted_at,\n  JSON.stringify({ model: $('Validate').item.json.model, input_tokens: $('Validate').item.json.input_tokens, output_tokens: $('Validate').item.json.output_tokens }),\n  JSON.stringify({ hits: $('KB lookup').item.json.hits }),\n  JSON.stringify({ model: $('Parse draft').item.json.model, input_tokens: $('Parse draft').item.json.input_tokens, output_tokens: $('Parse draft').item.json.output_tokens, unsure: $('Parse draft').item.json.is_unsure })\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2160,
+        0
+      ],
+      "id": "000f8ba8-0c1f-4660-9d80-89ed23cbec57",
+      "name": "Log steps",
+      "credentials": {
+        "postgres": {
+          "id": "haRzgJr5IZCml1gf",
+          "name": "Postgres account"
         }
       }
-    ]
-  },
+    }
+  ],
+  "pinData": {},
   "connections": {
     "Webhook": {
       "main": [
@@ -343,14 +339,25 @@
           }
         ]
       ]
+    },
+    "Save draft": {
+      "main": [
+        [
+          {
+            "node": "Log steps",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
-  "active": false,
+  "active": true,
   "settings": {
     "executionOrder": "v1",
     "binaryMode": "separate"
   },
-  "versionId": "d4b957a0-1429-4d66-8126-c957251030ac",
+  "versionId": "b5cb650d-e0c0-4b98-af5d-e4f2ee3bc514",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "3e67caf4ae95887d357519f3054a1b3806511d544a3ca95b9b584e94cd726230"
