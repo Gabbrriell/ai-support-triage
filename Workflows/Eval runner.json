@@ -1,0 +1,201 @@
+{
+  "name": "Eval runner",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "f8c9349f-a989-4367-b46f-ba6b6e88bbed",
+      "name": "Eval runner"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: \"openai/gpt-oss-120b\",\n  temperature: 0,\n  messages: [\n    { role: \"system\", content: `You triage support tickets for a marketing data platform that pulls data from ad platforms (Meta Ads, Google Ads, GA4, TikTok) into a warehouse and dashboards. Classify the ticket.\n\nCategories:\n- data_discrepancy: numbers differ from the source platform, or data is missing or delayed\n- connector_auth: connecting, adding, reauthorizing or giving access to data sources; failures caused by login, OAuth, expired tokens or permissions. Use this even when it is phrased as a how-to question.\n- api_error: extraction or API failures, rate limits, timeouts, error codes, schema changes\n- billing: invoices, payments, plan or pricing\n- other: anything else\n\nPriority is about impact, not wording. Ask: is the customer's data still flowing and correct, and will the problem fix itself?\n- urgent: data stopped or is wrong across many accounts or the whole workspace, OR the customer states a hard deadline within hours.\n- high: data has stopped flowing or is clearly wrong for an account and will not recover on its own. Examples: a connector disconnected or failing auth on every run, extractions erroring on every run since a point in time, errors returned by our API, a schema or field change breaking their pipeline, duplicated or inflated data, data no longer updating. Also money taken incorrectly, such as a double charge.\n- normal: the customer has a problem but data mostly still flows. Examples: a number mismatch on one report or campaign, timeouts or rate limits on one heavy job, a permission error on a single property, a reconnect prompt where they ask what to do, plan or pricing questions, compliance or data deletion requests.\n- low: nothing is broken. Questions about how things work or expected platform behaviour, how-to questions, feature requests, admin paperwork such as invoice corrections or tax forms, thank-you notes.\n\nWhen unsure between two priorities, pick the higher one. Missing a broken pipeline is worse than an extra human review.\n\nConfidence: 0 to 1, how sure you are about the category. Go below 0.6 if the ticket is vague or fits several categories. Reasoning: one short sentence.` },\n    { role: \"user\", content: \"Subject: \" + $json.subject + \"\\n\\n\" + $json.body }\n  ],\n  response_format: {\n    type: \"json_schema\",\n    json_schema: {\n      name: \"ticket_classification\",\n      strict: true,\n      schema: {\n        type: \"object\",\n        properties: {\n          category: { type: \"string\", enum: [\"data_discrepancy\",\"connector_auth\",\"api_error\",\"billing\",\"other\"] },\n          priority: { type: \"string\", enum: [\"urgent\",\"high\",\"normal\",\"low\"] },\n          confidence: { type: \"number\" },\n          reasoning: { type: \"string\" }\n        },\n        required: [\"category\",\"priority\",\"confidence\",\"reasoning\"],\n        additionalProperties: false\n      }\n    }\n  }\n}) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 5000
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        640,
+        0
+      ],
+      "id": "486b2bf2-c7f9-4ae5-bf29-0b070baca8f1",
+      "name": "Classify",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kIofmmplvWuShAMB",
+          "name": "groq"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO eval_runs (prompt_version, model, notes)\nVALUES ('v3', 'openai/gpt-oss-120b', 'priority by impact: is data flowing, will it self-recover; tie goes up')\nRETURNING id;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        224,
+        0
+      ],
+      "id": "4c63bd45-4eb7-4629-ac19-d4a21db84290",
+      "name": "Create run",
+      "credentials": {
+        "postgres": {
+          "id": "haRzgJr5IZCml1gf",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, subject, body FROM eval_cases ORDER BY id;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        448,
+        0
+      ],
+      "id": "83385df1-c37a-4552-a098-1a77dd806f85",
+      "name": "Get cases",
+      "credentials": {
+        "postgres": {
+          "id": "haRzgJr5IZCml1gf",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "let r = {};\ntry {\n   r = JSON.parse($json.choices?.[0]?.message?.content ?? '{}');\n} catch (e) { r = {}; }\n\nconst CATS = ['data_discrepancy','connector_auth','api_error','billing','other'];\nconst PRIS = ['urgent','high','normal','low'];\nconst is_valid = CATS.includes(r.category) && PRIS.includes(r.priority)\n  && typeof r.confidence === 'number' && r.confidence >= 0 && r.confidence <= 1;\n\nreturn {\n  run_id: $('Create run').first().json.id,\n  case_id: $('Get cases').item.json.id,\n  predicted_category: is_valid ? r.category : null,\n  predicted_priority: is_valid ? r.priority : null,\n  confidence: is_valid ? r.confidence : null,\n  is_valid_json: is_valid,\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        864,
+        0
+      ],
+      "id": "38f95617-4880-4bef-ac8b-798d72cb4520",
+      "name": "Score"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO eval_results (run_id, case_id, predicted_category, predicted_priority, confidence, is_valid_json)\nVALUES ($1, $2, $3, $4, $5, $6);",
+        "options": {
+          "queryReplacement": "={{ [ $json.run_id, $json.case_id, $json.predicted_category, $json.predicted_priority, $json.confidence, $json.is_valid_json ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1088,
+        0
+      ],
+      "id": "d0dd8eea-299f-4ac1-89d6-43f0af3e0169",
+      "name": "Save result",
+      "credentials": {
+        "postgres": {
+          "id": "haRzgJr5IZCml1gf",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Eval runner": {
+      "main": [
+        [
+          {
+            "node": "Create run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify": {
+      "main": [
+        [
+          {
+            "node": "Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create run": {
+      "main": [
+        [
+          {
+            "node": "Get cases",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get cases": {
+      "main": [
+        [
+          {
+            "node": "Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score": {
+      "main": [
+        [
+          {
+            "node": "Save result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "fb5be7ae-6182-4c00-9a06-1ea6b027a85b",
+  "meta": {
+    "instanceId": "3e67caf4ae95887d357519f3054a1b3806511d544a3ca95b9b584e94cd726230"
+  },
+  "nodeGroups": [],
+  "id": "poHYsa5j52nIZVYp",
+  "tags": []
+}

@@ -101,7 +101,7 @@ INSERT INTO eval_cases (subject, body, expected_category, expected_priority, not
 
 ('Bing Ads extraction error code 105',
  'Microsoft Advertising source fails with error code 105 InvalidCredentials, but the login works fine in the Bing UI.',
- 'connector_auth','normal', 'Tricky: looks like api_error but it is an auth problem'),
+ 'connector_auth','high', 'Tricky: looks like api_error but it is an auth problem'),
 
 -- billing --------------------------------------------------------------------
 ('Invoice has wrong company name',
