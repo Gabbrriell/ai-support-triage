@@ -148,12 +148,4 @@ scripts/                    demo traffic + simulated agent reviews
 - **The classify prompt exists in two places** (live flow and eval runner) and has to be kept in sync by hand.
 - **KB search is keyword-only**, so it misses synonyms ("spend" vs "cost").
 
-## Next steps
 
-1. **Grow the KB** from the `model_unsure` tickets. That's the biggest automation lever.
-2. **Held-out test set** labelled by a second person, to measure real generalisation and label agreement.
-3. **Semantic KB search** with pgvector (the `embedding` column is already in the schema).
-4. **Better routing signal than self-reported confidence**, e.g. agreement between two classification runs.
-5. **Single source for prompts**, with an n8n sub-workflow shared by the live flow and the eval runner.
-6. **Real helpdesk integration** (Zendesk or Freshdesk webhooks in, drafts posted back as internal notes).
-7. **MCP server over the ticket database**, so Claude Code can answer "what were the top issues this week?"
