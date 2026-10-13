@@ -1,0 +1,72 @@
+{
+  "name": "Review draft",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "review",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "3c159c75-4aea-4b30-8db3-db80df45ff96",
+      "name": "Webhook",
+      "webhookId": "7947035a-55a7-44bd-b467-1f2688fea17d"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH d AS (\n  UPDATE drafts\n  SET review_status = CASE WHEN $2 = 'approve' THEN 'approved' ELSE 'rejected' END,\n      final_body    = CASE WHEN $2 = 'approve' THEN coalesce(nullif($3, ''), draft_body) END,\n      reviewed_by   = $4,\n      reviewed_at   = now()\n  WHERE id = $1\n    AND review_status = 'pending'\n    AND $2 IN ('approve', 'reject')\n  RETURNING id, ticket_id, review_status, was_edited\n)\nUPDATE tickets t\nSET status = CASE WHEN d.review_status = 'approved' THEN 'approved' ELSE 'human_queue' END,\n    updated_at = now()\nFROM d WHERE t.id = d.ticket_id\nRETURNING d.*;",
+        "options": {
+          "queryReplacement": "={{ [ $json.body.draft_id, $json.body.action, $json.body.final_body ?? '', $json.body.reviewed_by ?? 'agent' ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        224,
+        0
+      ],
+      "id": "abbdb539-e84b-418a-8e91-6168facd1eeb",
+      "name": "Save review",
+      "credentials": {
+        "postgres": {
+          "id": "haRzgJr5IZCml1gf",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Save review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "0a242c27-fd95-4ff5-a0b8-a07b18c8c41f",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "3e67caf4ae95887d357519f3054a1b3806511d544a3ca95b9b584e94cd726230"
+  },
+  "nodeGroups": [],
+  "id": "1gro46k3avk8f0wS",
+  "tags": []
+}
