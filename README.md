@@ -1,12 +1,17 @@
 # AI Support Ticket Triage
 
-An AI agent that triages support tickets for a marketing data platform: it classifies each ticket, finds relevant help articles, drafts a reply, and routes it to the right queue. **Nothing is ever sent automatically.** A human approves, edits or rejects every draft, and every step is logged and measured.
+An AI agent that triages support tickets for a marketing data platform. It classifies each ticket, finds relevant help articles, drafts a reply and routes it to the right queue. **Nothing is ever sent automatically:** a human approves, edits or rejects every draft, and every step is logged and measured. An MCP server lets Claude Code query the ticket data directly.
 
 Built with n8n, Postgres and Grafana, all self-hosted in one `docker-compose.yml`. The LLM runs on Groq (`openai/gpt-oss-120b`), but the pipeline is model-agnostic: swapping models is a one-node change.
 
+**Highlights**
+
+- **Priority accuracy 64% → 78%** across 3 measured prompt versions, category accuracy 100%, with **zero critical tickets downgraded**
+- **~2.3 seconds** from ticket received to draft ready, about 2,000 tokens per ticket
+- **Found the real bottleneck:** knowledge base coverage, not the model. 51% of tickets had no matching article
+- **Claude Code + MCP** over the ticket database, read-only, for questions like "which KB articles should we write next?"
+
 ![Dashboard](docs/dashboard.png)
-
-
 
 ## The problem
 
@@ -31,6 +36,8 @@ flowchart LR
     J --> K
     K --> L[(Logs, latency,<br/>time saved)]
     L --> M[Grafana]
+    L --> N[MCP server<br/>read-only]
+    N --> O[Claude Code]
 ```
 
 1. **Ingest:** a webhook receives the ticket and stores it in Postgres with the raw payload.
@@ -39,7 +46,7 @@ flowchart LR
 4. **Draft:** the LLM writes a reply using only the KB articles it was given. If they don't cover the issue, it says so (`is_unsure`) instead of guessing, and asks for the specific details needed.
 5. **Route:** high or urgent priority, an unsure drafter, low confidence or invalid output goes to the human queue. Everything else becomes a draft waiting for an agent.
 6. **Review:** a separate endpoint lets an agent approve as-is, approve with edits, or reject. Whether the draft was edited is tracked automatically.
-7. **Measure:** latency and tokens per step, routing reasons, edit rate and estimated time saved, all queryable in SQL and shown in Grafana.
+7. **Measure:** latency and tokens per step, routing reasons, edit rate and estimated time saved, all queryable in SQL, shown in Grafana and available to Claude Code through MCP.
 
 ## Results
 
@@ -59,7 +66,7 @@ What I learned:
 - **Describe impact, not surface features.** v2 said "an error message alone is not high", so the model downgraded real outages. v3 asks whether the customer's data is still flowing, which generalises better.
 - **Errors aren't symmetric.** An extra human review costs a few minutes. A missed outage costs a customer's trust. v3 deliberately breaks ties upwards.
 - **Labels can be wrong too.** After v3, I reviewed every miss and asked "is the model wrong or is my label wrong?" One label was inconsistent with my own rubric (#24, auth failing on every run, labelled normal while a similar ticket was high). I fixed it with a written reason, and all runs were rescored against the corrected label.
-- **I stopped at v3.** Tuning further against the same 36 tickets mostly overfits. The proper next step is a held-out test set the prompt has never seen.
+- **I stopped at v3.** Tuning further against the same 36 tickets would mostly overfit to them.
 
 ### Live pipeline (synthetic demo traffic)
 
@@ -72,13 +79,34 @@ What I learned:
 | Approved drafts edited by the agent | ~22% |
 | Estimated time saved per approved draft | ~12.5 min |
 
-### The most useful finding: the bottleneck is the knowledge base, not the AI
+### The bottleneck is the knowledge base, not the AI
 
 In a demo run of 43 tickets, the drafter flagged `model_unsure` on **51%** of them. For 11 tickets it was the *only* reason they went to a human. The KB has just 6 articles, so the drafter correctly refuses to guess.
 
-That means automation could roughly double (about 28% to 53%) **without touching the model**, just by writing help articles for the gaps. The "why tickets went where they did" panel shows exactly which gaps to fill first.
+That means automation could roughly double (about 28% to 53%) **without touching the model**, just by writing help articles for the gaps. The "why tickets went where they did" panel in Grafana, and the `kb_gaps` MCP tool below, show exactly which gaps to fill first.
 
-Second finding: **the confidence threshold never fired once.** The model reports 0.93 to 0.98 confidence on everything, including a ticket that just says "numbers look weird". Self-reported LLM confidence is poorly calibrated, so routing relies on priority and the drafter's `is_unsure` flag instead.
+### Self-reported confidence is useless for routing
+
+The confidence threshold never fired once. The model reports 0.93 to 0.98 confidence on everything, including a ticket that just says "numbers look weird". Self-reported LLM confidence is poorly calibrated, so routing relies on priority and the drafter's `is_unsure` flag instead.
+
+## Claude Code + MCP
+
+`mcp-server/server.py` is a small MCP server over the ticket database. Registered in Claude Code, it turns the support data into something you can just ask about.
+
+| Tool | What it answers |
+|---|---|
+| `ticket_summary` | Tickets, % auto-drafted, open queue, edit rate, minutes saved, pipeline time |
+| `top_issues` | Categories by volume, how many were high/urgent, example subjects |
+| `human_queue` | What's waiting for a human, oldest first, and why |
+| `kb_gaps` | Where the drafter was unsure because no article covered the issue |
+| `eval_results` | Classifier accuracy per prompt version |
+| `describe_schema`, `run_sql` | Custom read-only queries |
+
+Asked *"what were the top issues this week, and which KB articles should we write next?"*, Claude Code pulled `top_issues` and `kb_gaps` and came back with a prioritised writing plan: 22 unsure tickets in 30 days, led by connector re-authentication for platforms other than Google Ads (TikTok, LinkedIn's 60-day token expiry, Bing error 105, connectors lost after an SSO change), then diagnosis guides for data discrepancies the KB doesn't cover yet. It also pointed out that connector auth and API errors are the most severe categories: 11 of their 15 tickets were high or urgent.
+
+![Claude Code using the MCP server](docs/mcp-kb-gaps.png)
+
+**Safety:** the server connects as the read-only `grafana_ro` role, inside read-only transactions, with a 5 second statement timeout. It can't change or delete anything. I tested this by hiding a `DELETE` inside a `SELECT` (`WITH x AS (DELETE ...) SELECT ...`), and the database refused it.
 
 ## How time saved is calculated
 
@@ -89,14 +117,14 @@ Second finding: **the confidence threshold never fired once.** The model reports
 - **Never auto-send.** Every draft needs a human decision. The AI saves time on reading, categorising and writing, not on judgment.
 - **Strict schema plus code validation.** The LLM is forced into a JSON schema, and a code node re-checks every field. Bad output gets flagged and routed to a human instead of crashing the flow.
 - **Keep every attempt.** Classifications store the raw response, model and prompt version, so a new prompt never overwrites history.
-- **Least privilege.** Three database roles: n8n's internal storage, the workflows (read/write), and Grafana (read-only). Ports are bound to localhost only.
+- **Least privilege.** Three database roles: n8n's internal storage, the workflows (read/write), and Grafana plus the MCP server (read-only). Ports are bound to localhost only.
 - **Parameterised SQL everywhere.** Ticket text never gets concatenated into queries.
 - **Model-agnostic.** The project started on Gemini and moved to Groq after hitting the Gemini free tier's 20 requests/day limit mid-eval. Only the HTTP node and the response parser changed.
-- **Dashboard as code.** The Grafana dashboard and datasource are provisioned from files in this repo.
+- **Everything as code.** Schema, roles, Grafana datasource and dashboard, and the MCP config all live in this repo.
 
 ## Run it yourself
 
-Requirements: Docker Desktop and a free [Groq API key](https://console.groq.com).
+Requirements: Docker Desktop, Python 3.10+ (for the MCP server) and a free [Groq API key](https://console.groq.com).
 
 ```bash
 git clone https://github.com/Gabbrriell/ai-support-triage.git
@@ -120,6 +148,11 @@ Then:
    powershell -ExecutionPolicy Bypass -File scripts\review-demo.ps1
    ```
 6. Open Grafana at http://localhost:3000, then **Dashboards > AI Support Triage**.
+7. For Claude Code, install the MCP server's dependencies:
+   ```bash
+   python -m pip install -r mcp-server/requirements.txt
+   ```
+   Then open Claude Code in the project folder. It picks up `.mcp.json` automatically, so approve the `support-triage` server and check it with `/mcp`. The server reads the database password from `.env`.
 
 Send a single ticket:
 
@@ -132,20 +165,22 @@ Invoke-RestMethod -Uri http://localhost:5678/webhook/ticket -Method Post -Body $
 
 ```
 docker-compose.yml          Postgres (pgvector), n8n, Grafana
+.mcp.json                   registers the MCP server with Claude Code
 db/init/                    roles, schema, starter KB (runs on first start)
 db/seed/eval_cases.sql      36 labelled eval tickets
 Workflows/                  n8n exports: Ticket triage, Eval runner, Review draft
 grafana/provisioning/       datasource + dashboard as code
+mcp-server/                 read-only MCP server over the ticket database
 scripts/                    demo traffic + simulated agent reviews
+docs/                       screenshots
 ```
 
 ## Limitations
 
 - **Demo data is synthetic.** Live metrics come from the eval tickets replayed as traffic and simulated reviews, not real customers.
-- **The eval set is small and was used for tuning.** 36 tickets, labelled by one person, with prompts iterated against the same set.
+- **The eval set is small and was used for tuning.** 36 tickets, labelled by one person, with prompts iterated against the same set, so the v3 score is likely optimistic for unseen tickets.
 - **Time-saved baselines are estimates**, see above.
 - **Webhooks have no authentication.** Fine on localhost; production needs header auth or signature verification.
 - **The classify prompt exists in two places** (live flow and eval runner) and has to be kept in sync by hand.
 - **KB search is keyword-only**, so it misses synonyms ("spend" vs "cost").
-
-
+- **No helpdesk integration.** Tickets arrive by webhook, and reviews happen through an API call rather than inside Zendesk or Freshdesk.
